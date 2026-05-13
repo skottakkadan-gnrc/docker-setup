@@ -31,10 +31,6 @@ GIT_META_gateway_REMOTE="dse-gateway"
 # Get the directory where the script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Setup Docker if not installed
-docker_setup
-
-
 # Logging functions
 log_info() {
     echo -e "${GREEN}$1${RESET}"
@@ -61,15 +57,22 @@ docker_setup() {
     if ! command -v docker &> /dev/null; then
         log_yellow "Installing Docker..."
         sudo apt update || exit 1
-        sudo apt install -y docker.io || exit 1
+        sudo apt install -y docker.io ca-certificates || exit 1
         sudo systemctl start docker || exit 1
         sudo systemctl enable docker || exit 1
+        sudo systemctl restart docker || exit 1
         sudo usermod -aG docker $USER || exit 1
         log_info "Docker installed successfully. You may need to log out and back in for group changes to take effect."
     else
         log_info "Docker is already installed."
+        # Ensure ca-certificates are installed and Docker is restarted
+        sudo apt install -y ca-certificates || exit 1
+        sudo systemctl restart docker || exit 1
     fi
 }
+
+# Setup Docker if not installed
+docker_setup
 
 # Function to check if the Docker image exists
 image_exists() {
