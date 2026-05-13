@@ -24,12 +24,43 @@ RESET='\033[0m'
 
 CONTAINER_PREFIX="gateway-yocto-docker-image"
 YOCTO_USER_HOME="/home/yoctouser"
-YOCTO_REPO_DIR="$HOME/yocto_workspace/gateway_repo"
 GIT_META_gateway_BRANCH="main"
 GIT_META_gateway_REMOTE="dse-gateway"
 
+# Resolve the host user's home directory for non-root path operations
+if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+    HOST_USER="$SUDO_USER"
+else
+    HOST_USER="$(logname 2>/dev/null || id -un 2>/dev/null || true)"
+    if [ -z "$HOST_USER" ] || [ "$HOST_USER" = "root" ]; then
+        HOST_USER="$(id -un 2>/dev/null || true)"
+    fi
+fi
+
+HOST_HOME="$(getent passwd "$HOST_USER" | cut -d: -f6)"
+if [ -z "$HOST_HOME" ]; then
+    HOST_HOME="/home/$HOST_USER"
+fi
+
+if [ -z "$HOST_HOME" ]; then
+    log_error "Unable to determine the host user's home directory."
+    exit 1
+fi
+
+HOST_BASE_DIR="$HOST_HOME"
+HOST_BIN_DIR="$HOST_HOME/bin"
+HOST_BASHRC="$HOST_HOME/.bashrc"
+HOST_SSH_DIR="$HOST_HOME/.ssh"
+HOST_GITCONFIG="$HOST_HOME/.gitconfig"
+HOST_DOWNLOADS_DIR="$HOST_BASE_DIR/downloads"
+HOST_SSTATE_DIR="$HOST_BASE_DIR/sstate-cache"
+YOCTO_REPO_DIR="$HOST_BASE_DIR/gateway_repo"
+
 # Get the directory where the script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+CONTAINER_ENGINE=""
+ENGINE_DISPLAY_NAME=""
 
 # Logging functions
 log_info() {
@@ -52,27 +83,62 @@ log_prompt() {
     echo -e "   ${LIGHT_CYAN}$1${RESET}"
 }
 
-# Function to setup Docker
-docker_setup() {
-    if ! command -v docker &> /dev/null; then
-        log_yellow "Installing Docker..."
-        sudo apt update || exit 1
-        sudo apt install -y docker.io ca-certificates || exit 1
-        sudo systemctl start docker || exit 1
-        sudo systemctl enable docker || exit 1
-        sudo systemctl restart docker || exit 1
-        sudo usermod -aG docker $USER || exit 1
-        log_info "Docker installed successfully. You may need to log out and back in for group changes to take effect."
+# Function to pick and setup the container engine
+container_engine_setup() {
+    if command -v podman &> /dev/null; then
+        CONTAINER_ENGINE="podman"
+        ENGINE_DISPLAY_NAME="Podman"
+    elif command -v docker &> /dev/null; then
+        CONTAINER_ENGINE="docker"
+        ENGINE_DISPLAY_NAME="Docker"
     else
-        log_info "Docker is already installed."
-        # Ensure ca-certificates are installed and Docker is restarted
+        log_yellow "Installing Podman..."
+        sudo apt update || exit 1
+        sudo apt install -y podman ca-certificates || exit 1
+        CONTAINER_ENGINE="podman"
+        ENGINE_DISPLAY_NAME="Podman"
+        log_info "Podman installed successfully."
+    fi
+
+    log_info "$ENGINE_DISPLAY_NAME will be used for container operations."
+
+    if [ "$CONTAINER_ENGINE" = "podman" ]; then
+        # Configure Podman for insecure registries to bypass proxy certificate issues
+        mkdir -p ~/.config/containers
+        cat > ~/.config/containers/registries.conf << 'EOF'
+unqualified-search-registries = ["docker.io"]
+
+[[registry]]
+location = "docker.io"
+insecure = true
+
+[[registry]]
+location = "registry-1.docker.io"
+insecure = true
+EOF
+        log_info "Podman configured for insecure registry access (proxy bypass)."
+    fi
+
+    if [ "$CONTAINER_ENGINE" = "docker" ]; then
+        if ! command -v docker &> /dev/null; then
+            log_error "Docker is not available after installation. Exiting."
+            exit 1
+        fi
         sudo apt install -y ca-certificates || exit 1
         sudo systemctl restart docker || exit 1
     fi
 }
 
-# Setup Docker if not installed
-docker_setup
+container_engine_setup
+
+# Wrapper function so existing docker commands use the chosen engine
+docker() {
+    if [ -z "$CONTAINER_ENGINE" ]; then
+        log_error "Container engine is not initialized."
+        exit 1
+    fi
+    command "$CONTAINER_ENGINE" "$@"
+}
 
 # Function to check if the Docker image exists
 image_exists() {
@@ -105,7 +171,7 @@ create_image() {
         log_error "Error: Image with name '$IMAGE_NAME' already exists. Aborting image creation."
         return
     else
-        log_yellow "Creating docker image '$IMAGE_NAME'..."
+        log_yellow "Creating $ENGINE_DISPLAY_NAME image '$IMAGE_NAME'..."
         docker build -t $IMAGE_NAME "${SCRIPT_DIR}" || exit 1
         log_info "Image '$IMAGE_NAME' created successfully."
     fi
@@ -125,25 +191,25 @@ repo_setup() {
     # Check if repo is installed
     if ! command -v repo &> /dev/null; then
         log_yellow "Installing repo..."
-        # Create the bin directory in the home directory if it doesn't exist
-        mkdir -p ~/bin
+        # Create the bin directory in the host user's home directory if it doesn't exist
+        mkdir -p "$HOST_BIN_DIR"
 
-        # Download the latest repo script
-        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo || exit 1
+        # Download the latest repo script (with insecure flag for corporate proxy)
+        curl -L -k https://storage.googleapis.com/git-repo-downloads/repo > "$HOST_BIN_DIR/repo" || exit 1
 
         # Make the repo script executable
-        chmod a+x ~/bin/repo || exit 1
+        chmod a+x "$HOST_BIN_DIR/repo" || exit 1
 
-        # Add ~/bin to the PATH environment variable if it's not already there
-        if ! echo $PATH | grep -q "$HOME/bin"; then
-            echo 'export PATH=~/bin:$PATH' >> ~/.bashrc
-            export PATH=~/bin:$PATH  # Ensure the current session is updated
-            source ~/.bashrc || exit 1
+        # Add the host user's bin directory to the PATH environment variable if it's not already there
+        if ! echo "$PATH" | grep -q "$HOST_BIN_DIR"; then
+            echo "export PATH=\"$HOST_BIN_DIR:\$PATH\"" >> "$HOST_BASHRC"
+            export PATH="$HOST_BIN_DIR:$PATH"
+            source "$HOST_BASHRC" || exit 1
         else
-            # Ensure ~/bin is at the beginning of the PATH
-            sed -i 's|PATH=\(.*\)|PATH=~/bin:\1|' ~/.bashrc || exit 1
-            export PATH=~/bin:$PATH  # Ensure the current session is updated
-            source ~/.bashrc || exit 1
+            # Ensure host bin is at the beginning of the PATH
+            sed -i "s|PATH=\(.*\)|PATH=\"$HOST_BIN_DIR:\1\"|" "$HOST_BASHRC" || exit 1
+            export PATH="$HOST_BIN_DIR:$PATH"
+            source "$HOST_BASHRC" || exit 1
         fi
 
         # Verify the installation
@@ -160,12 +226,51 @@ repo_setup() {
     repo --version
 }
 
+# Configure SSL/TLS to bypass certificate verification for corporate proxy
+configure_ssl_bypass() {
+    export PYTHONHTTPSVERIFY=0
+    export GIT_SSL_NO_VERIFY=1
+    export REPO_URL="git@gerrit.googlesource.com:git-repo"
+    git config --global http.sslverify false
+    git config --global http.sslCAInfo /dev/null
+}
+
+# Function to initialize repo with better error handling
+init_and_sync_repo() {
+    log_yellow "Updating CA certificates..."
+    sudo apt update && sudo apt install -y ca-certificates || log_yellow "Failed to update CA certificates, proceeding anyway..."
+    log_yellow "Initializing repo..."
+    export GIT_SSL_NO_VERIFY=true
+    export GIT_SSH_COMMAND="ssh -i $HOST_HOME/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    if [ ! -d .repo/repo ]; then
+        log_yellow "Downloading repo source manually..."
+        mkdir -p .repo
+        GIT_SSL_NO_VERIFY=1 git clone https://gerrit.googlesource.com/git-repo .repo/repo || log_yellow "Failed to download repo source manually, proceeding..."
+    fi
+    if ! repo init --no-repo-verify --repo-url "$REPO_URL" -u git@github.com:skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
+        log_yellow "SSH URL failed, trying HTTPS..."
+        if ! repo init --no-repo-verify --repo-url "$REPO_URL" -u https://github.com/skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
+            log_error "Error: Failed to initialize repo with both SSH and HTTPS URLs."
+            return 1
+        fi
+    fi
+    
+    log_yellow "Syncing repo (this may take a while)..."
+    if ! repo sync --jobs=1 --verbose 2>&1; then
+        log_error "Error: repo sync failed. Please check your network and authentication."
+        log_yellow "You can try running 'repo sync' manually in $YOCTO_REPO_DIR"
+        return 1
+    fi
+    
+    return 0
+}
+
 # Function to check if required files are present
 check_required_files() {
     local missing_files=0
 
-    if [ ! -d ~/.ssh ]; then
-        log_error "Error: ~/.ssh directory is missing."
+    if [ ! -d "$HOST_SSH_DIR" ]; then
+        log_error "Error: $HOST_SSH_DIR directory is missing."
         missing_files=1
     fi
 
@@ -173,6 +278,37 @@ check_required_files() {
         log_error "One or more required files are missing. Exiting."
         exit 1
     fi
+}
+
+# Function to verify meta-gateway is a valid git repository
+is_meta_gateway_git_repo() {
+    if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
+        return 1
+    fi
+    git -C "$YOCTO_REPO_DIR/sources/meta-gateway" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+# Function to determine whether an existing repo directory can be safely initialized
+can_initialize_repo_dir() {
+    if [ ! -d "$YOCTO_REPO_DIR" ]; then
+        return 0
+    fi
+
+    if is_meta_gateway_git_repo; then
+        return 1
+    fi
+
+    # Allow initialization if the directory is empty or contains only an incomplete sources tree
+    if [ -z "$(find "$YOCTO_REPO_DIR" -mindepth 1 -maxdepth 1 -not -name 'sources' -print -quit)" ]; then
+        if [ ! -d "$YOCTO_REPO_DIR/sources" ]; then
+            return 0
+        fi
+        if [ -z "$(find "$YOCTO_REPO_DIR/sources" -mindepth 1 -type f -print -quit)" ]; then
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 # Function to create a new container
@@ -192,40 +328,61 @@ create_container() {
             docker rm $container_name
         fi
 
-        # Check if the gateway repository exists
-        if [ ! -d "$YOCTO_REPO_DIR" ]; then
+        # Check if the gateway repository exists and can be initialized or updated
+        if [ ! -d "$YOCTO_REPO_DIR" ] || can_initialize_repo_dir; then
+            # Configure SSL bypass for corporate proxy
+            configure_ssl_bypass
+            
             # setup your system repo tool
             repo_setup
 
-            mkdir -p "$HOME/yocto_workspace" || exit 1
-            cd "$HOME/yocto_workspace" || exit 1
+            mkdir -p "$HOST_BASE_DIR" || exit 1
+            cd "$HOST_BASE_DIR" || exit 1
 
-            mkdir "$YOCTO_REPO_DIR" || exit 1
+            mkdir -p "$YOCTO_REPO_DIR" || exit 1
             cd "$YOCTO_REPO_DIR" || exit 1
-            repo init -u git@github.com:skottakkadan-gnrc/898-manifest.git -b main -m default.xml || exit 1
-            repo sync || exit 1
 
+            init_and_sync_repo || exit 1
+
+            # Verify the meta-gateway directory was created
+            if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
+                log_error "Error: meta-gateway directory not found after repo sync. The manifest may be incorrect."
+                exit 1
+            fi
+
+            log_yellow "Setting up meta-gateway environment..."
             cd "$YOCTO_REPO_DIR/sources/meta-gateway" || exit 1
-            cp "$YOCTO_REPO_DIR/sources/meta-gateway/setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
+            cp "setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
             git checkout HEM-311_newHardware || exit 1
-	    # git checkout main
-            #cp "$YOCTO_REPO_DIR/sources/meta-gateway/gateway-setup-platform.sh" "$YOCTO_REPO_DIR/gateway-setup-platform.sh"
             chmod +x "$YOCTO_REPO_DIR/setup-environment" || exit 1
 
-            if [ ! -d "$HOME/yocto_workspace/downloads" ]; then
-                mkdir "$HOME/yocto_workspace/downloads" || exit 1
+            if [ ! -d "$HOST_DOWNLOADS_DIR" ]; then
+                mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
             fi
 
-            if [ ! -d "$HOME/yocto_workspace/sstate-cache" ]; then
-                mkdir "$HOME/yocto_workspace/sstate-cache" || exit 1
+            if [ ! -d "$HOST_SSTATE_DIR" ]; then
+                mkdir -p "$HOST_SSTATE_DIR" || exit 1
             fi
 
-            log_info "default.xml Repository cloned and checked out successfully."
-            # Return to the initial directory
+            log_info "Repository cloned and checked out successfully."
             cd "$initial_dir"
         else
+            # Verify necessary subdirectories exist
+            if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
+                log_error "Error: $YOCTO_REPO_DIR seems to contain an invalid or corrupted checkout."
+                log_yellow "Please remove or rename it, then rerun this script."
+                exit 1
+            fi
             update_meta_gateway
         fi
+    else
+        # Verify necessary subdirectories exist
+        if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
+            log_error "Error: meta-gateway directory not found. Repository may be corrupted."
+            exit 1
+        fi
+        update_meta_gateway
+    fi
 
         # Increase inotify limit. Required for Yocto builds,
         # Reason: Observed 'ERROR: No space left on device or exceeds fs.inotify.max_user_watches?' during yocto bitbaking
@@ -235,38 +392,40 @@ create_container() {
             sudo sysctl -p || exit 1
         fi
 
-        if [ ! -d "$HOME/yocto_workspace/${container_name}_build/tmp" ]; then
-            mkdir -p "$HOME/yocto_workspace/${container_name}_build/tmp" || exit 1
+        if [ ! -d "$HOST_BASE_DIR/${container_name}_build/tmp" ]; then
+            mkdir -p "$HOST_BASE_DIR/${container_name}_build/tmp" || exit 1
         fi
 
-        cp -r ~/.ssh $HOME/yocto_workspace/ssh || exit 1
+        cp -r "$HOST_SSH_DIR" "$HOST_BASE_DIR/ssh" || exit 1
 
-        log_yellow "Creating docker container '$container_name'..."
+        log_yellow "Creating $ENGINE_DISPLAY_NAME container '$container_name'..."
         
         cp "$YOCTO_REPO_DIR/sources/meta-gateway/setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
 
         docker run -it --name $container_name \
-            -v "$HOME/yocto_workspace/ssh:${YOCTO_USER_HOME}/.ssh" \
+            -v "$HOST_BASE_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
             -v "$YOCTO_REPO_DIR/setup-environment:${YOCTO_USER_HOME}/setup-environment" \
             -v "$YOCTO_REPO_DIR/sources:${YOCTO_USER_HOME}/sources" \
-            -v "$HOME/yocto_workspace/downloads:${YOCTO_USER_HOME}/downloads" \
+            -v "$HOST_DOWNLOADS_DIR:${YOCTO_USER_HOME}/downloads" \
             -v "$YOCTO_REPO_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
-            -v "$HOME/yocto_workspace/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_xwayland/tmp" \
-            -v "$HOME/yocto_workspace/sstate-cache:${YOCTO_USER_HOME}/build_xwayland/sstate-cache" \
-            -v "$HOME/.gitconfig:${YOCTO_USER_HOME}/.gitconfig" \
+            -v "$HOST_BASE_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_xwayland/tmp" \
+            -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build_xwayland/sstate-cache" \
+            -v "$HOST_GITCONFIG:${YOCTO_USER_HOME}/.gitconfig" \
             $image_name
         if [ $? -eq 0 ]; then
             log_info "Container '$container_name' created and started successfully."
         else
             log_error "Failed to create and start the container."
         fi
-    else
-        log_error "Invalid choice."
-    fi
 }
 
 update_meta_gateway() {
     local current_dir=$(pwd)
+    if ! is_meta_gateway_git_repo; then
+        log_error "Error: $YOCTO_REPO_DIR/sources/meta-gateway is not a valid git repository."
+        exit 1
+    fi
+
     cd "$YOCTO_REPO_DIR/sources/meta-gateway" || exit 1
 
     # Check for uncommitted changes
@@ -341,7 +500,7 @@ delete_container() {
     if [[ "$proceed" == "yes" || "$proceed" == "Yes"|| "$proceed" == "YES" ]]; then
         local container_name=$1
         docker rm $container_name
-        rm -rf $HOME/yocto_workspace/${container_name}_build  # Remove the specific build directory
+        rm -rf "$HOST_BASE_DIR/${container_name}_build"  # Remove the specific build directory
         log_info "Container '$container_name' and its build directory deleted successfully."
     fi
 }
@@ -377,7 +536,7 @@ auto_create_and_start() {
     local image_suffix="auto"
     IMAGE_NAME="gateway-yocto-docker-image_$image_suffix"
     if ! image_exists $IMAGE_NAME; then
-        log_yellow "Creating image '$IMAGE_NAME'..."
+        log_yellow "Creating $ENGINE_DISPLAY_NAME image '$IMAGE_NAME'..."
         docker build -t $IMAGE_NAME "${SCRIPT_DIR}" || exit 1
         log_info "Image '$IMAGE_NAME' created successfully."
     fi
@@ -391,31 +550,45 @@ auto_create_and_start() {
         docker rm $container_name
     fi
 
-    if [ ! -d "$YOCTO_REPO_DIR" ]; then
+    if [ ! -d "$YOCTO_REPO_DIR" ] || can_initialize_repo_dir; then
+        configure_ssl_bypass
         repo_setup
-        mkdir -p "$HOME/yocto_workspace" || exit 1
-        cd "$HOME/yocto_workspace" || exit 1
-        mkdir "$YOCTO_REPO_DIR" || exit 1
+        mkdir -p "$HOST_BASE_DIR" || exit 1
+        cd "$HOST_BASE_DIR" || exit 1
+        mkdir -p "$YOCTO_REPO_DIR" || exit 1
         cd "$YOCTO_REPO_DIR" || exit 1
-        repo init -u git@github.com:skottakkadan-gnrc/898-manifest.git -b main -m default.xml || exit 1
-        repo sync || exit 1
+        
+        init_and_sync_repo || exit 1
+
+        # Verify the meta-gateway directory was created
+        if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
+            log_error "Error: meta-gateway directory not found after repo sync. The manifest may be incorrect."
+            exit 1
+        fi
+
+        log_yellow "Setting up meta-gateway environment..."
         cd "$YOCTO_REPO_DIR/sources/meta-gateway" || exit 1
-        cp "$YOCTO_REPO_DIR/sources/meta-gateway/setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
-        #git checkout main || exit 1
+        cp "setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
         git checkout HEM-311_newHardware || exit 1
         chmod +x "$YOCTO_REPO_DIR/setup-environment" || exit 1
 
-        if [ ! -d "$HOME/yocto_workspace/downloads" ]; then
-            mkdir "$HOME/yocto_workspace/downloads" || exit 1
+        if [ ! -d "$HOST_DOWNLOADS_DIR" ]; then
+            mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
         fi
 
-        if [ ! -d "$HOME/yocto_workspace/sstate-cache" ]; then
-            mkdir "$HOME/yocto_workspace/sstate-cache" || exit 1
+        if [ ! -d "$HOST_SSTATE_DIR" ]; then
+            mkdir -p "$HOST_SSTATE_DIR" || exit 1
         fi
 
         log_info "default.xml Repository cloned and checked out successfully."
         cd "$initial_dir"
     else
+        # Verify necessary subdirectories exist
+        if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
+            log_error "Error: $YOCTO_REPO_DIR seems to contain an invalid or corrupted checkout."
+            log_yellow "Please remove or rename it, then rerun this script."
+            exit 1
+        fi
         update_meta_gateway
     fi
 
@@ -427,25 +600,25 @@ auto_create_and_start() {
         sudo sysctl -p || exit 1
     fi
 
-    if [ ! -d "$HOME/yocto_workspace/${container_name}_build/tmp" ]; then
-        mkdir -p "$HOME/yocto_workspace/${container_name}_build/tmp" || exit 1
+    if [ ! -d "$HOST_BASE_DIR/${container_name}_build/tmp" ]; then
+        mkdir -p "$HOST_BASE_DIR/${container_name}_build/tmp" || exit 1
     fi
 
-    cp -r ~/.ssh $HOME/yocto_workspace/ssh || exit 1
+    cp -r "$HOST_SSH_DIR" "$HOST_BASE_DIR/ssh" || exit 1
 
-    log_yellow "Creating docker container '$container_name'..."
+    log_yellow "Creating $ENGINE_DISPLAY_NAME container '$container_name'..."
         
     cp "$YOCTO_REPO_DIR/sources/meta-gateway/setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
 
     docker run -it --name $container_name \
-        -v "$HOME/yocto_workspace/ssh:${YOCTO_USER_HOME}/.ssh" \
+        -v "$HOST_BASE_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
         -v "$YOCTO_REPO_DIR/setup-environment:${YOCTO_USER_HOME}/setup-environment" \
         -v "$YOCTO_REPO_DIR/sources:${YOCTO_USER_HOME}/sources" \
-        -v "$HOME/yocto_workspace/downloads:${YOCTO_USER_HOME}/downloads" \
+        -v "$HOST_DOWNLOADS_DIR:${YOCTO_USER_HOME}/downloads" \
         -v "$YOCTO_REPO_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
-        -v "$HOME/yocto_workspace/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_xwayland/tmp" \
-        -v "$HOME/yocto_workspace/sstate-cache:${YOCTO_USER_HOME}/build_xwayland/sstate-cache" \
-        -v "$HOME/.gitconfig:${YOCTO_USER_HOME}/.gitconfig" \
+        -v "$HOST_BASE_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_xwayland/tmp" \
+        -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build_xwayland/sstate-cache" \
+        -v "$HOST_GITCONFIG:${YOCTO_USER_HOME}/.gitconfig" \
         $IMAGE_NAME
 
     if [ $? -eq 0 ]; then
@@ -471,7 +644,7 @@ clean_all_containers() {
     if [[ "$proceed" == "yes" || "$proceed" == "Yes" || "$proceed" == "YES" ]]; then
         for container in $containers; do
             docker rm $container
-            rm -rf $HOME/yocto_workspace/${container}_buildTmp  # Remove the specific build directory
+            rm -rf "$HOST_BASE_DIR/${container}_buildTmp"  # Remove the specific build directory
             log_info "Container '$container' and its build directory deleted successfully."
         done
     else
