@@ -24,8 +24,7 @@ RESET='\033[0m'
 
 CONTAINER_PREFIX="gateway-yocto-docker-image"
 YOCTO_USER_HOME="/home/yoctouser"
-GIT_META_gateway_BRANCH="main"
-GIT_META_gateway_REMOTE="dse-gateway"
+GIT_META_DSE_BSP_BRANCH="0899/V1/Main"
 
 # Resolve the host user's home directory for non-root path operations
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
@@ -52,9 +51,12 @@ HOST_BIN_DIR="$HOST_HOME/bin"
 HOST_BASHRC="$HOST_HOME/.bashrc"
 HOST_SSH_DIR="$HOST_HOME/.ssh"
 HOST_GITCONFIG="$HOST_HOME/.gitconfig"
-HOST_DOWNLOADS_DIR="$HOST_BASE_DIR/downloads"
+HOST_WORK_DIR="$HOST_BASE_DIR/gateway_workdir"
+HOST_SOURCES_DIR="$HOST_WORK_DIR/sources"
+HOST_CHECKOUT_DIR="$HOST_SOURCES_DIR"
 HOST_SSTATE_DIR="$HOST_BASE_DIR/sstate-cache"
-YOCTO_REPO_DIR="$HOST_BASE_DIR/gateway_repo"
+HOST_DOWNLOADS_DIR="$HOST_WORK_DIR/downloads"
+LOCAL_REPO_BINARY="$HOST_WORK_DIR/.repo/repo/repo"
 
 # Get the directory where the script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -230,9 +232,44 @@ repo_setup() {
 configure_ssl_bypass() {
     export PYTHONHTTPSVERIFY=0
     export GIT_SSL_NO_VERIFY=1
-    export REPO_URL="git@gerrit.googlesource.com:git-repo"
+    export REPO_URL="https://gerrit.googlesource.com/git-repo"
     git config --global http.sslverify false
     git config --global http.sslCAInfo /dev/null
+}
+
+run_as_host_user() {
+    if [ "$(id -u)" -eq 0 ] && [ "$HOST_USER" != "root" ]; then
+        sudo -u "$HOST_USER" HOME="$HOST_HOME" PATH="$PATH" "$@"
+    else
+        "$@"
+    fi
+}
+
+resolve_checkout_dir() {
+    HOST_CHECKOUT_DIR="$HOST_SOURCES_DIR"
+}
+
+repo_command() {
+    if [ -x "$LOCAL_REPO_BINARY" ]; then
+        echo "$LOCAL_REPO_BINARY"
+    else
+        command -v repo
+    fi
+}
+
+rewrite_manifest_remotes() {
+    local remotes_file="$HOST_WORK_DIR/.repo/manifests/_remotes.xml"
+    if [ -f "$remotes_file" ]; then
+        sed -i \
+            -e 's|git://git.yoctoproject.org|https://git.yoctoproject.org|g' \
+            -e 's|git://git.openembedded.org|https://git.openembedded.org|g' \
+            -e 's|git://git.ti.com|https://git.ti.com|g' \
+            -e 's|https://github.com/ecobee|ssh://git@github.com/ecobee|g' \
+            -e 's|https://github.com/|ssh://git@github.com/|g' \
+            -e 's|https://github.com|ssh://git@github.com|g' \
+            "$remotes_file"
+        log_yellow "Rewrote manifest remotes for corporate proxy, preserving GitHub SSH access."
+    fi
 }
 
 # Function to initialize repo with better error handling
@@ -242,26 +279,79 @@ init_and_sync_repo() {
     log_yellow "Initializing repo..."
     export GIT_SSL_NO_VERIFY=true
     export GIT_SSH_COMMAND="ssh -i $HOST_HOME/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
     if [ ! -d .repo/repo ]; then
         log_yellow "Downloading repo source manually..."
         mkdir -p .repo
-        GIT_SSL_NO_VERIFY=1 git clone https://gerrit.googlesource.com/git-repo .repo/repo || log_yellow "Failed to download repo source manually, proceeding..."
+        run_as_host_user env GIT_SSL_NO_VERIFY=1 git clone https://gerrit.googlesource.com/git-repo .repo/repo || log_yellow "Failed to download repo source manually, proceeding..."
     fi
-    if ! repo init --no-repo-verify --repo-url "$REPO_URL" -u git@github.com:skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
-        log_yellow "SSH URL failed, trying HTTPS..."
-        if ! repo init --no-repo-verify --repo-url "$REPO_URL" -u https://github.com/skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
-            log_error "Error: Failed to initialize repo with both SSH and HTTPS URLs."
+    local repo_tool
+    repo_tool="$(repo_command)"
+if ! run_as_host_user env GIT_SSL_NO_VERIFY=1 "$repo_tool" init --config-name --no-repo-verify --repo-url "$REPO_URL" -u https://github.com/skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
+            log_yellow "HTTPS manifest failed, trying SSH manifest..."
+            if ! run_as_host_user env GIT_SSH_COMMAND="$GIT_SSH_COMMAND" "$repo_tool" init --config-name --no-repo-verify --repo-url "$REPO_URL" -u git@github.com:skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
+            log_error "Error: Failed to initialize repo with both HTTPS and SSH manifest URLs."
             return 1
         fi
     fi
-    
+
+    rewrite_manifest_remotes
+
     log_yellow "Syncing repo (this may take a while)..."
-    if ! sudo repo sync --jobs=1 --verbose 2>&1; then
+    if ! run_as_host_user env GIT_SSL_NO_VERIFY=1 GIT_SSH_COMMAND="$GIT_SSH_COMMAND" "$repo_tool" sync --jobs=1 --verbose 2>&1; then
         log_error "Error: repo sync failed. Please check your network and authentication."
-        log_yellow "You can try running 'repo sync' manually in $YOCTO_REPO_DIR"
+        log_yellow "You can try running '$repo_tool sync' manually in $HOST_WORK_DIR"
         return 1
     fi
-    
+
+    # Ensure the repo metadata is accessible to the container user
+    log_yellow "Adjusting .repo permissions for container access..."
+    # Make metadata and worktrees writable so container users can create
+    # lockfiles (e.g. index.lock). This is intentionally permissive to
+    # avoid git permission errors inside user-mapped containers. If you
+    # require stricter permissions, modify this to a more conservative
+    # setting or run the chown step below as root.
+    if chmod -R a+rwX "$HOST_WORK_DIR/.repo" "$HOST_SOURCES_DIR" 2>/dev/null; then
+        log_yellow "Updated permissions to allow container write access."
+    else
+        log_yellow "Warning: failed to set permissive permissions; will attempt more conservative update."
+        chmod -R u+rwX,go+rX "$HOST_WORK_DIR/.repo" || log_yellow "Warning: failed to update .repo permissions; container may still not have access."
+    fi
+
+    # Ensure downloads, sstate and work/build dirs are writable by the container
+    mkdir -p "$HOST_DOWNLOADS_DIR" "$HOST_SSTATE_DIR"
+    if chmod -R a+rwX "$HOST_DOWNLOADS_DIR" "$HOST_SSTATE_DIR" "$HOST_WORK_DIR" 2>/dev/null; then
+        log_yellow "Updated downloads, sstate and work directories to allow container write access."
+    else
+        log_yellow "Warning: failed to set permissive permissions on downloads/sstate/work dirs; attempting conservative update."
+        chmod -R u+rwX,go+rX "$HOST_DOWNLOADS_DIR" "$HOST_SSTATE_DIR" || log_yellow "Warning: failed to update downloads/sstate permissions"
+    fi
+    # Make sure the metadata and working tree are owned by the host user so
+    # the container user (same UID) can operate on the checkout without git
+    # complaining about dubious ownership.
+    if id -u "$HOST_USER" >/dev/null 2>&1; then
+        if [ "$(id -u)" -eq 0 ]; then
+            chown -R "$HOST_USER":"$HOST_USER" "$HOST_WORK_DIR/.repo" || log_yellow "Warning: failed to chown .repo to $HOST_USER"
+            chown -R "$HOST_USER":"$HOST_USER" "$HOST_SOURCES_DIR" || log_yellow "Warning: failed to chown sources to $HOST_USER"
+        else
+            if command -v sudo >/dev/null 2>&1; then
+                sudo chown -R "$HOST_USER":"$HOST_USER" "$HOST_WORK_DIR/.repo" || log_yellow "Warning: sudo chown .repo to $HOST_USER failed"
+                sudo chown -R "$HOST_USER":"$HOST_USER" "$HOST_SOURCES_DIR" || log_yellow "Warning: sudo chown sources to $HOST_USER failed"
+            else
+                log_yellow "Cannot change ownership: not running as root and sudo is unavailable."
+            fi
+        fi
+    else
+        log_yellow "Host user $HOST_USER not found; skipping chown step."
+    fi
+
+    # Copy mete-lpp, since NO access for SAHEER
+    resolve_checkout_dir
+
+    if [ ! -d "$HOST_CHECKOUT_DIR/meta-lpp" ]; then
+        cp /mnt/c/SAHEER/meta-lpp/meta-lpp "$HOST_CHECKOUT_DIR/" -r
+    fi
+
     return 0
 }
 
@@ -280,17 +370,22 @@ check_required_files() {
     fi
 }
 
-# Function to verify meta-gateway is a valid git repository
+# Function to verify meta-dse-bsp is a valid git repository
 is_meta_gateway_git_repo() {
-    if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
-        return 1
+    if [ -d "$HOST_SOURCES_DIR/meta-dse-bsp" ]; then
+        git -C "$HOST_SOURCES_DIR/meta-dse-bsp" rev-parse --is-inside-work-tree >/dev/null 2>&1
+        return $?
     fi
-    git -C "$YOCTO_REPO_DIR/sources/meta-gateway" rev-parse --is-inside-work-tree >/dev/null 2>&1
+    return 1
 }
 
 # Function to determine whether an existing repo directory can be safely initialized
 can_initialize_repo_dir() {
-    if [ ! -d "$YOCTO_REPO_DIR" ]; then
+    if [ ! -d "$HOST_SOURCES_DIR" ]; then
+        return 0
+    fi
+
+    if [ -d "$HOST_SOURCES_DIR/sources/meta-dse-bsp" ]; then
         return 0
     fi
 
@@ -299,11 +394,11 @@ can_initialize_repo_dir() {
     fi
 
     # Allow initialization if the directory is empty or contains only an incomplete sources tree
-    if [ -z "$(find "$YOCTO_REPO_DIR" -mindepth 1 -maxdepth 1 -not -name 'sources' -print -quit)" ]; then
-        if [ ! -d "$YOCTO_REPO_DIR/sources" ]; then
+    if [ -z "$(find "$HOST_SOURCES_DIR" -mindepth 1 -maxdepth 1 -not -name 'sources' -print -quit)" ]; then
+        if [ ! -d "$HOST_SOURCES_DIR" ]; then
             return 0
         fi
-        if [ -z "$(find "$YOCTO_REPO_DIR/sources" -mindepth 1 -type f -print -quit)" ]; then
+        if [ -z "$(find "$HOST_SOURCES_DIR" -mindepth 1 -type f -print -quit)" ]; then
             return 0
         fi
     fi
@@ -313,6 +408,9 @@ can_initialize_repo_dir() {
 
 # Function to create a new container
 create_container() {
+    if [ ! -d "$HOST_WORK_DIR" ]; then
+        mkdir -p "$HOST_WORK_DIR" || exit 1
+    fi
     check_required_files  # Check for required files before proceeding
 
     log_prompt "Available images in '$CONTAINER_PREFIX':"
@@ -329,32 +427,26 @@ create_container() {
         fi
 
         # Check if the gateway repository exists and can be initialized or updated
-        if [ ! -d "$YOCTO_REPO_DIR" ] || can_initialize_repo_dir; then
+        if [ ! -d "$HOST_SOURCES_DIR" ] || can_initialize_repo_dir; then
             # Configure SSL bypass for corporate proxy
             configure_ssl_bypass
             
             # setup your system repo tool
             repo_setup
 
-            mkdir -p "$HOST_BASE_DIR" || exit 1
-            cd "$HOST_BASE_DIR" || exit 1
+            cd "$HOST_WORK_DIR" || exit 1
 
-            mkdir -p "$YOCTO_REPO_DIR" || exit 1
-            cd "$YOCTO_REPO_DIR" || exit 1
-
+            mkdir -p "$HOST_SOURCES_DIR" || exit 1
+            resolve_checkout_dir || exit 1
             init_and_sync_repo || exit 1
 
-            # Verify the meta-gateway directory was created
-            if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
-                log_error "Error: meta-gateway directory not found after repo sync. The manifest may be incorrect."
-                exit 1
-            fi
+            # Verify the meta-dse-bsp directory was created
+            resolve_checkout_dir
 
-            log_yellow "Setting up meta-gateway environment..."
-            cd "$YOCTO_REPO_DIR/sources/meta-gateway" || exit 1
-            cp "setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
-            git checkout HEM-311_newHardware || exit 1
-            chmod +x "$YOCTO_REPO_DIR/setup-environment" || exit 1
+            if [ ! -d "$HOST_CHECKOUT_DIR/meta-dse-bsp" ]; then
+                log_error "Error: meta-dse-bsp directory not found after repo sync. The manifest may be incorrect."
+                exit 0 # TO DO
+            fi
 
             if [ ! -d "$HOST_DOWNLOADS_DIR" ]; then
                 mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
@@ -367,21 +459,23 @@ create_container() {
             log_info "Repository cloned and checked out successfully."
             cd "$initial_dir"
         else
+            resolve_checkout_dir
             # Verify necessary subdirectories exist
-            if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
-                log_error "Error: $YOCTO_REPO_DIR seems to contain an invalid or corrupted checkout."
+            if [ ! -d "$HOST_CHECKOUT_DIR/meta-dse-bsp" ]; then
+                log_error "Error: $HOST_SOURCES_DIR seems to contain an invalid or corrupted checkout."
                 log_yellow "Please remove or rename it, then rerun this script."
                 exit 1
             fi
-            update_meta_gateway
+            # update_meta_gateway part of manifest
         fi
     else
+        resolve_checkout_dir
         # Verify necessary subdirectories exist
-        if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
-            log_error "Error: meta-gateway directory not found. Repository may be corrupted."
+        if [ ! -d "$HOST_CHECKOUT_DIR/meta-dse-bsp" ]; then
+            log_error "Error: meta-dse-bsp directory not found. Repository may be corrupted."
             exit 1
         fi
-        update_meta_gateway
+         # update_meta_gateway part of manifest
     fi
 
         # Increase inotify limit. Required for Yocto builds,
@@ -392,26 +486,47 @@ create_container() {
             sudo sysctl -p || exit 1
         fi
 
-        if [ ! -d "$HOST_BASE_DIR/${container_name}_build/tmp" ]; then
-            mkdir -p "$HOST_BASE_DIR/${container_name}_build/tmp" || exit 1
+        if [ ! -d "$HOST_WORK_DIR/${container_name}_build/tmp" ]; then
+            mkdir -p "$HOST_WORK_DIR/${container_name}_build/tmp" || exit 1
         fi
 
-        cp -r "$HOST_SSH_DIR" "$HOST_BASE_DIR/ssh" || exit 1
+        if [ ! -d "$HOST_DOWNLOADS_DIR" ]; then
+            mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
+        fi
+
+        cp -r "$HOST_SSH_DIR" "$HOST_WORK_DIR/ssh" || exit 1
 
         log_yellow "Creating $ENGINE_DISPLAY_NAME container '$container_name'..."
         
-        cp "$YOCTO_REPO_DIR/sources/meta-gateway/setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
+        # cp "$HOST_SOURCES_DIR/meta-dse-bsp/setup-environment" "$HOST_SOURCES_DIR/setup-environment" || exit 1
 
-        docker run -it --name $container_name \
-            -v "$HOST_BASE_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
-            -v "$YOCTO_REPO_DIR/setup-environment:${YOCTO_USER_HOME}/setup-environment" \
-            -v "$YOCTO_REPO_DIR/sources:${YOCTO_USER_HOME}/sources" \
+        # Start container detached so we can configure git safe.directory entries,
+        # then attach interactively.
+        docker run -d --network host --name $container_name \
+            --cap-add NET_RAW \
+            -v "$HOST_WORK_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
+            -v "$HOST_SOURCES_DIR:${YOCTO_USER_HOME}/sources" \
             -v "$HOST_DOWNLOADS_DIR:${YOCTO_USER_HOME}/downloads" \
-            -v "$YOCTO_REPO_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
-            -v "$HOST_BASE_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_xwayland/tmp" \
-            -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build_xwayland/sstate-cache" \
+            -v "$HOST_WORK_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
+            -v "$HOST_WORK_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_dse_gw/tmp" \
             -v "$HOST_GITCONFIG:${YOCTO_USER_HOME}/.gitconfig" \
-            $image_name
+            $image_name tail -f /dev/null || {
+                log_error "Failed to start container $container_name"
+                return 1
+            }
+
+        # Add system-level safe.directory entries for each project so git
+        # inside the container won't complain about ownership.
+        for proj in "$HOST_SOURCES_DIR"/*; do
+            [ -d "$proj" ] || continue
+            base=$(basename "$proj")
+            docker exec -u 0 $container_name git config --system --add safe.directory "${YOCTO_USER_HOME}/sources/$base" || true
+        done
+
+        # Attach interactive shell
+        docker exec -it $container_name /bin/bash
+        #   -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build_dse_gw/sstate-cache" \
+
         if [ $? -eq 0 ]; then
             log_info "Container '$container_name' created and started successfully."
         else
@@ -421,17 +536,18 @@ create_container() {
 
 update_meta_gateway() {
     local current_dir=$(pwd)
+    resolve_checkout_dir
     if ! is_meta_gateway_git_repo; then
-        log_error "Error: $YOCTO_REPO_DIR/sources/meta-gateway is not a valid git repository."
+        log_error "Error: $HOST_CHECKOUT_DIR/meta-dse-bsp is not a valid git repository."
         exit 1
     fi
 
-    cd "$YOCTO_REPO_DIR/sources/meta-gateway" || exit 1
+    cd "$HOST_CHECKOUT_DIR/meta-dse-bsp" || exit 1
 
     # Check for uncommitted changes
     if [ -n "$(git status --porcelain)" ]; then
-        log_error "Uncommitted local changes detected in the '$YOCTO_REPO_DIR/sources/meta-gateway' repository."
-        read -p "$(log_prompt "Do you want to proceed without pulling the latest changes from meta-gateway repo? (yes/no): ")" proceed_without_pull
+        log_error "Uncommitted local changes detected in the '$HOST_CHECKOUT_DIR/meta-dse-bsp' repository."
+        read -p "$(log_prompt "Do you want to proceed without pulling the latest changes from meta-dse-bsp repo? (yes/no): ")" proceed_without_pull
         if [[ "$proceed_without_pull" != "yes" ]]; then
             log_error "Please commit and push your changes before proceeding."
             exit 1
@@ -439,8 +555,8 @@ update_meta_gateway() {
             log_yellow "Proceeding without pulling the latest changes."
         fi
     else
-        log_yellow "Pulling the latest changes from the meta-gateway repo..."
-        git pull $GIT_META_gateway_REMOTE $GIT_META_gateway_BRANCH || exit 1
+        log_yellow "Pulling the latest changes from the meta-dse-bsp repo..."
+        git pull $GIT_META_gateway_REMOTE $GIT_META_DSE_BSP_BRANCH || exit 1
     fi
 
     cd "$current_dir" || exit 1
@@ -450,7 +566,7 @@ update_meta_gateway() {
 start_and_attach_container() {
     local container_name=$1
 
-    update_meta_gateway
+    # update_meta_gateway part of manifest
 
     docker start $container_name
 
@@ -470,7 +586,7 @@ start_and_attach_container() {
 attach_container() {
     local container_name=$1
 
-    update_meta_gateway
+    # update_meta_gateway part of manifest
 
     docker exec -it $container_name /bin/bash
 }
@@ -479,7 +595,7 @@ attach_container() {
 exec_container() {
     local container_name=$1
 
-    update_meta_gateway
+    # update_meta_gateway part of manifest
 
     docker exec -it $container_name /bin/bash
 }
@@ -500,7 +616,7 @@ delete_container() {
     if [[ "$proceed" == "yes" || "$proceed" == "Yes"|| "$proceed" == "YES" ]]; then
         local container_name=$1
         docker rm $container_name
-        rm -rf "$HOST_BASE_DIR/${container_name}_build"  # Remove the specific build directory
+        rm -rf "$HOST_WORK_DIR/${container_name}_build"  # Remove the specific build directory
         log_info "Container '$container_name' and its build directory deleted successfully."
     fi
 }
@@ -550,27 +666,22 @@ auto_create_and_start() {
         docker rm $container_name
     fi
 
-    if [ ! -d "$YOCTO_REPO_DIR" ] || can_initialize_repo_dir; then
+    if [ ! -d "$HOST_SOURCES_DIR" ] || can_initialize_repo_dir; then
         configure_ssl_bypass
         repo_setup
-        mkdir -p "$HOST_BASE_DIR" || exit 1
-        cd "$HOST_BASE_DIR" || exit 1
-        mkdir -p "$YOCTO_REPO_DIR" || exit 1
-        cd "$YOCTO_REPO_DIR" || exit 1
+        mkdir -p "$HOST_WORK_DIR" || exit 1
+        cd "$HOST_WORK_DIR" || exit 1
+        mkdir -p "$HOST_SOURCES_DIR" || exit 1
+        cd "$HOST_SOURCES_DIR" || exit 1
         
         init_and_sync_repo || exit 1
 
-        # Verify the meta-gateway directory was created
-        if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
-            log_error "Error: meta-gateway directory not found after repo sync. The manifest may be incorrect."
+        # Verify the meta-dse-bsp directory was created
+        resolve_checkout_dir
+        if [ ! -d "$HOST_CHECKOUT_DIR/meta-dse-bsp" ]; then
+            log_error "Error: meta-dse-bsp directory not found after repo sync. The manifest may be incorrect."
             exit 1
         fi
-
-        log_yellow "Setting up meta-gateway environment..."
-        cd "$YOCTO_REPO_DIR/sources/meta-gateway" || exit 1
-        cp "setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
-        git checkout HEM-311_newHardware || exit 1
-        chmod +x "$YOCTO_REPO_DIR/setup-environment" || exit 1
 
         if [ ! -d "$HOST_DOWNLOADS_DIR" ]; then
             mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
@@ -584,12 +695,12 @@ auto_create_and_start() {
         cd "$initial_dir"
     else
         # Verify necessary subdirectories exist
-        if [ ! -d "$YOCTO_REPO_DIR/sources/meta-gateway" ]; then
-            log_error "Error: $YOCTO_REPO_DIR seems to contain an invalid or corrupted checkout."
+        if [ ! -d "$HOST_CHECKOUT_DIR/meta-dse-bsp" ]; then
+            log_error "Error: $HOST_SOURCES_DIR seems to contain an invalid or corrupted checkout."
             log_yellow "Please remove or rename it, then rerun this script."
             exit 1
         fi
-        update_meta_gateway
+        # update_meta_gateway part of manifest
     fi
 
     # Increase inotify limit. Required for Yocto builds, observed 
@@ -600,26 +711,25 @@ auto_create_and_start() {
         sudo sysctl -p || exit 1
     fi
 
-    if [ ! -d "$HOST_BASE_DIR/${container_name}_build/tmp" ]; then
-        mkdir -p "$HOST_BASE_DIR/${container_name}_build/tmp" || exit 1
+    if [ ! -d "$HOST_WORK_DIR/${container_name}_build/tmp" ]; then
+        mkdir -p "$HOST_WORK_DIR/${container_name}_build/tmp" || exit 1
     fi
 
-    cp -r "$HOST_SSH_DIR" "$HOST_BASE_DIR/ssh" || exit 1
+    cp -r "$HOST_SSH_DIR" "$HOST_WORK_DIR/ssh" || exit 1
 
     log_yellow "Creating $ENGINE_DISPLAY_NAME container '$container_name'..."
         
-    cp "$YOCTO_REPO_DIR/sources/meta-gateway/setup-environment" "$YOCTO_REPO_DIR/setup-environment" || exit 1
+    # cp "$HOST_SOURCES_DIR/meta-dse-bsp/setup-environment" "$HOST_SOURCES_DIR/setup-environment" || exit 1
 
-    docker run -it --name $container_name \
-        -v "$HOST_BASE_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
-        -v "$YOCTO_REPO_DIR/setup-environment:${YOCTO_USER_HOME}/setup-environment" \
-        -v "$YOCTO_REPO_DIR/sources:${YOCTO_USER_HOME}/sources" \
+    docker run -it --network host --cap-add NET_RAW --name $container_name \
+        -v "$HOST_WORK_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
+        -v "$HOST_SOURCES_DIR:${YOCTO_USER_HOME}/sources" \
         -v "$HOST_DOWNLOADS_DIR:${YOCTO_USER_HOME}/downloads" \
-        -v "$YOCTO_REPO_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
-        -v "$HOST_BASE_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_xwayland/tmp" \
-        -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build_xwayland/sstate-cache" \
+        -v "$HOST_WORK_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
+        -v "$HOST_WORK_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_dse_gw/tmp" \
         -v "$HOST_GITCONFIG:${YOCTO_USER_HOME}/.gitconfig" \
         $IMAGE_NAME
+       #  -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build_dse_gw/sstate-cache" \
 
     if [ $? -eq 0 ]; then
         log_info "Container '$container_name' created and started successfully."
@@ -644,7 +754,7 @@ clean_all_containers() {
     if [[ "$proceed" == "yes" || "$proceed" == "Yes" || "$proceed" == "YES" ]]; then
         for container in $containers; do
             docker rm $container
-            rm -rf "$HOST_BASE_DIR/${container}_buildTmp"  # Remove the specific build directory
+            rm -rf "$HOST_WORK_DIR/${container}_buildTmp"  # Remove the specific build directory
             log_info "Container '$container' and its build directory deleted successfully."
         done
     else
