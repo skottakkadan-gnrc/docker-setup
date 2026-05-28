@@ -142,6 +142,54 @@ repo_init_env() {
     fi
 }
 
+install_zscaler_ca_from_windows() {
+    log_info "Checking for Zscaler corporate CA"
+
+    if [ "$CORP_PROXY" != "true" ]; then
+        log_info "CORP_PROXY is not true; skipping Zscaler CA import."
+        return 0
+    fi
+
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+        log_warn "powershell.exe not available from WSL; skipping Zscaler CA import."
+        return 0
+    fi
+
+    local win_profile
+    local win_profile_wsl
+    local cert_path
+
+    win_profile="$(cmd.exe /c echo %USERPROFILE% | tr -d '\r')"
+    win_profile_wsl="$(wslpath "$win_profile")"
+    cert_path="$win_profile_wsl/zscaler-root-ca.crt"
+
+    powershell.exe -NoProfile -Command '
+$cert = Get-ChildItem Cert:\LocalMachine\Root,Cert:\CurrentUser\Root |
+    Where-Object { $_.Subject -like "*Zscaler*" -or $_.Issuer -like "*Zscaler*" } |
+    Select-Object -First 1
+
+if (-not $cert) {
+    Write-Error "No Zscaler certificate found in Windows Root stores"
+    exit 2
+}
+
+$bytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+$pem = "-----BEGIN CERTIFICATE-----`n" + [Convert]::ToBase64String($bytes, [System.Base64FormattingOptions]::InsertLineBreaks) + "`n-----END CERTIFICATE-----"
+Set-Content -Path "$env:USERPROFILE\zscaler-root-ca.crt" -Value $pem -Encoding ascii
+' || {
+        log_warn "Could not export Zscaler CA from Windows."
+        return 0
+    }
+
+    if [ -f "$cert_path" ]; then
+        sudo cp "$cert_path" /usr/local/share/ca-certificates/zscaler-root-ca.crt
+        sudo update-ca-certificates
+        log_info "Installed Zscaler CA into WSL trust store."
+    else
+        log_warn "Zscaler CA export file not found: $cert_path"
+    fi
+}
+
 clone_repo_source() {
     if [ -d "$LOCAL_REPO_SRC_DIR" ]; then
         return 0
@@ -353,6 +401,7 @@ main() {
         init)
             install_packages
             setup_locale
+            install_zscaler_ca_from_windows
             verify_host_tools
             init_repo
             ;;
@@ -372,6 +421,7 @@ main() {
         all)
             install_packages
             setup_locale
+            install_zscaler_ca_from_windows
             verify_host_tools
             init_repo
             sync_repo
