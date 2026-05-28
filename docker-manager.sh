@@ -26,6 +26,11 @@ CONTAINER_PREFIX="gateway-yocto-docker-image"
 YOCTO_USER_HOME="/home/yoctouser"
 GIT_META_DSE_BSP_BRANCH="0899/V1/Main"
 
+# Set CORP_PROXY=true only when behind a TLS-intercepting corporate proxy.
+# When false (default) we keep normal TLS verification and do NOT mark
+# registries insecure. Override at call time, e.g.:  CORP_PROXY=true ./docker-manager.sh
+CORP_PROXY="${CORP_PROXY:-false}"
+
 # Resolve the host user's home directory for non-root path operations
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
     HOST_USER="$SUDO_USER"
@@ -63,6 +68,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CONTAINER_ENGINE=""
 ENGINE_DISPLAY_NAME=""
+
+# Rootless-Podman UID mapping args; populated by compute_userns_args().
+PODMAN_USERNS_ARGS=()
 
 # Logging functions
 log_info() {
@@ -105,9 +113,10 @@ container_engine_setup() {
     log_info "$ENGINE_DISPLAY_NAME will be used for container operations."
 
     if [ "$CONTAINER_ENGINE" = "podman" ]; then
-        # Configure Podman for insecure registries to bypass proxy certificate issues
         mkdir -p ~/.config/containers
-        cat > ~/.config/containers/registries.conf << 'EOF'
+        if [ "$CORP_PROXY" = "true" ]; then
+            # Behind a TLS-intercepting proxy: allow insecure registry access.
+            cat > ~/.config/containers/registries.conf << 'EOF'
 unqualified-search-registries = ["docker.io"]
 
 [[registry]]
@@ -118,7 +127,15 @@ insecure = true
 location = "registry-1.docker.io"
 insecure = true
 EOF
-        log_info "Podman configured for insecure registry access (proxy bypass)."
+            log_info "Podman configured for insecure registry access (proxy bypass)."
+        else
+            # Normal network: keep TLS verification, just allow bare image names
+            # like 'ubuntu:22.04' to resolve against Docker Hub.
+            cat > ~/.config/containers/registries.conf << 'EOF'
+unqualified-search-registries = ["docker.io"]
+EOF
+            log_info "Podman configured (docker.io search registry, TLS verification on)."
+        fi
     fi
 
     if [ "$CONTAINER_ENGINE" = "docker" ]; then
@@ -132,6 +149,30 @@ EOF
 }
 
 container_engine_setup
+
+# Compute the user-namespace mapping for rootless Podman.
+# Rootless Podman remaps container UIDs into subordinate host UIDs, so a bare
+# bind mount ends up owned by a "stranger" UID and git complains about
+# ownership. keep-id maps the container's yoctouser back to the host user.
+compute_userns_args() {
+    PODMAN_USERNS_ARGS=()
+    [ "$CONTAINER_ENGINE" = "podman" ] || return 0
+
+    # Podman 4.0+ supports the keep-id:uid=,gid= form, which maps the host
+    # user onto container UID/GID 1000 (yoctouser) regardless of the host UID.
+    local pmajor
+    pmajor="$(podman version --format '{{.Client.Version}}' 2>/dev/null | cut -d. -f1)"
+    if [ "${pmajor:-0}" -ge 4 ] 2>/dev/null; then
+        PODMAN_USERNS_ARGS=(--userns=keep-id:uid=1000,gid=1000)
+    else
+        # Older Podman: plain keep-id. This is correct as long as the host
+        # user's UID is 1000 (the default first user on Ubuntu/WSL, which
+        # matches yoctouser in the Dockerfile).
+        PODMAN_USERNS_ARGS=(--userns=keep-id)
+    fi
+}
+
+compute_userns_args
 
 # Wrapper function so existing docker commands use the chosen engine
 docker() {
@@ -196,8 +237,8 @@ repo_setup() {
         # Create the bin directory in the host user's home directory if it doesn't exist
         mkdir -p "$HOST_BIN_DIR"
 
-        # Download the latest repo script (with insecure flag for corporate proxy)
-        curl -L -k https://storage.googleapis.com/git-repo-downloads/repo > "$HOST_BIN_DIR/repo" || exit 1
+        # Download the latest repo script
+        curl -L $CURL_INSECURE https://storage.googleapis.com/git-repo-downloads/repo > "$HOST_BIN_DIR/repo" || exit 1
 
         # Make the repo script executable
         chmod a+x "$HOST_BIN_DIR/repo" || exit 1
@@ -228,14 +269,30 @@ repo_setup() {
     repo --version
 }
 
-# Configure SSL/TLS to bypass certificate verification for corporate proxy
+# Configure SSL/TLS handling. REPO_URL is always set. TLS verification is only
+# disabled when CORP_PROXY=true (i.e. a proxy is intercepting certificates).
 configure_ssl_bypass() {
+    export REPO_URL="https://gerrit.googlesource.com/git-repo"
+
+    if [ "$CORP_PROXY" != "true" ]; then
+        # No proxy: keep TLS verification on. Do not touch the global gitconfig.
+        return 0
+    fi
+
     export PYTHONHTTPSVERIFY=0
     export GIT_SSL_NO_VERIFY=1
-    export REPO_URL="https://gerrit.googlesource.com/git-repo"
     git config --global http.sslverify false
     git config --global http.sslCAInfo /dev/null
 }
+
+# Per-command SSL flags derived from CORP_PROXY (empty when no proxy).
+if [ "$CORP_PROXY" = "true" ]; then
+    GIT_SSL_ENV="GIT_SSL_NO_VERIFY=1"
+    CURL_INSECURE="-k"
+else
+    GIT_SSL_ENV=""
+    CURL_INSECURE=""
+fi
 
 run_as_host_user() {
     if [ "$(id -u)" -eq 0 ] && [ "$HOST_USER" != "root" ]; then
@@ -268,7 +325,7 @@ rewrite_manifest_remotes() {
             -e 's|https://github.com/|ssh://git@github.com/|g' \
             -e 's|https://github.com|ssh://git@github.com|g' \
             "$remotes_file"
-        log_yellow "Rewrote manifest remotes for corporate proxy, preserving GitHub SSH access."
+        log_yellow "Rewrote manifest remotes, preserving GitHub SSH access."
     fi
 }
 
@@ -277,17 +334,16 @@ init_and_sync_repo() {
     log_yellow "Updating CA certificates..."
     sudo apt update && sudo apt install -y ca-certificates || log_yellow "Failed to update CA certificates, proceeding anyway..."
     log_yellow "Initializing repo..."
-    export GIT_SSL_NO_VERIFY=true
     export GIT_SSH_COMMAND="ssh -i $HOST_HOME/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
     if [ ! -d .repo/repo ]; then
         log_yellow "Downloading repo source manually..."
         mkdir -p .repo
-        run_as_host_user env GIT_SSL_NO_VERIFY=1 git clone https://gerrit.googlesource.com/git-repo .repo/repo || log_yellow "Failed to download repo source manually, proceeding..."
+        run_as_host_user env ${GIT_SSL_ENV} git clone https://gerrit.googlesource.com/git-repo .repo/repo || log_yellow "Failed to download repo source manually, proceeding..."
     fi
     local repo_tool
     repo_tool="$(repo_command)"
-if ! run_as_host_user env GIT_SSL_NO_VERIFY=1 "$repo_tool" init --config-name --no-repo-verify --repo-url "$REPO_URL" -u https://github.com/skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
+if ! run_as_host_user env ${GIT_SSL_ENV} "$repo_tool" init --config-name --no-repo-verify --repo-url "$REPO_URL" -u https://github.com/skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
             log_yellow "HTTPS manifest failed, trying SSH manifest..."
             if ! run_as_host_user env GIT_SSH_COMMAND="$GIT_SSH_COMMAND" "$repo_tool" init --config-name --no-repo-verify --repo-url "$REPO_URL" -u git@github.com:skottakkadan-gnrc/898-manifest.git -b main -m default.xml 2>&1; then
             log_error "Error: Failed to initialize repo with both HTTPS and SSH manifest URLs."
@@ -298,7 +354,7 @@ if ! run_as_host_user env GIT_SSL_NO_VERIFY=1 "$repo_tool" init --config-name --
     rewrite_manifest_remotes
 
     log_yellow "Syncing repo (this may take a while)..."
-    if ! run_as_host_user env GIT_SSL_NO_VERIFY=1 GIT_SSH_COMMAND="$GIT_SSH_COMMAND" "$repo_tool" sync --jobs=1 --verbose 2>&1; then
+    if ! run_as_host_user env ${GIT_SSL_ENV} GIT_SSH_COMMAND="$GIT_SSH_COMMAND" "$repo_tool" sync --jobs=1 --verbose 2>&1; then
         log_error "Error: repo sync failed. Please check your network and authentication."
         log_yellow "You can try running '$repo_tool sync' manually in $HOST_WORK_DIR"
         return 1
@@ -307,10 +363,8 @@ if ! run_as_host_user env GIT_SSL_NO_VERIFY=1 "$repo_tool" init --config-name --
     # Ensure the repo metadata is accessible to the container user
     log_yellow "Adjusting .repo permissions for container access..."
     # Make metadata and worktrees writable so container users can create
-    # lockfiles (e.g. index.lock). This is intentionally permissive to
-    # avoid git permission errors inside user-mapped containers. If you
-    # require stricter permissions, modify this to a more conservative
-    # setting or run the chown step below as root.
+    # lockfiles (e.g. index.lock). With --userns=keep-id the container user
+    # already maps to the host user, so this is mostly belt-and-braces.
     if chmod -R a+rwX "$HOST_WORK_DIR/.repo" "$HOST_SOURCES_DIR" 2>/dev/null; then
         log_yellow "Updated permissions to allow container write access."
     else
@@ -327,8 +381,8 @@ if ! run_as_host_user env GIT_SSL_NO_VERIFY=1 "$repo_tool" init --config-name --
         chmod -R u+rwX,go+rX "$HOST_DOWNLOADS_DIR" "$HOST_SSTATE_DIR" || log_yellow "Warning: failed to update downloads/sstate permissions"
     fi
     # Make sure the metadata and working tree are owned by the host user so
-    # the container user (same UID) can operate on the checkout without git
-    # complaining about dubious ownership.
+    # the container user (mapped via keep-id) can operate on the checkout
+    # without git complaining about dubious ownership.
     if id -u "$HOST_USER" >/dev/null 2>&1; then
         if [ "$(id -u)" -eq 0 ]; then
             chown -R "$HOST_USER":"$HOST_USER" "$HOST_WORK_DIR/.repo" || log_yellow "Warning: failed to chown .repo to $HOST_USER"
@@ -428,9 +482,9 @@ create_container() {
 
         # Check if the gateway repository exists and can be initialized or updated
         if [ ! -d "$HOST_SOURCES_DIR" ] || can_initialize_repo_dir; then
-            # Configure SSL bypass for corporate proxy
+            # Configure SSL handling (sets REPO_URL; only disables TLS if CORP_PROXY=true)
             configure_ssl_bypass
-            
+
             # setup your system repo tool
             repo_setup
 
@@ -494,21 +548,26 @@ create_container() {
             mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
         fi
 
+        # Shared sstate cache persists build artifacts across containers (much
+        # faster rebuilds). Mounted into the build dir below.
+        mkdir -p "$HOST_SSTATE_DIR" || exit 1
+
         cp -r "$HOST_SSH_DIR" "$HOST_WORK_DIR/ssh" || exit 1
 
         log_yellow "Creating $ENGINE_DISPLAY_NAME container '$container_name'..."
-        
+
         # cp "$HOST_SOURCES_DIR/meta-dse-bsp/setup-environment" "$HOST_SOURCES_DIR/setup-environment" || exit 1
 
         # Start container detached so we can configure git safe.directory entries,
         # then attach interactively.
         docker run -d --network host --name $container_name \
-            --cap-add NET_RAW \
+            "${PODMAN_USERNS_ARGS[@]}" \
             -v "$HOST_WORK_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
             -v "$HOST_SOURCES_DIR:${YOCTO_USER_HOME}/sources" \
             -v "$HOST_DOWNLOADS_DIR:${YOCTO_USER_HOME}/downloads" \
             -v "$HOST_WORK_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
-            -v "$HOST_WORK_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_dse_gw/tmp" \
+            -v "$HOST_WORK_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build-dse-gateway/tmp" \
+            -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build-dse-gateway/sstate-cache" \
             -v "$HOST_GITCONFIG:${YOCTO_USER_HOME}/.gitconfig" \
             $image_name tail -f /dev/null || {
                 log_error "Failed to start container $container_name"
@@ -525,7 +584,6 @@ create_container() {
 
         # Attach interactive shell
         docker exec -it $container_name /bin/bash
-        #   -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build_dse_gw/sstate-cache" \
 
         if [ $? -eq 0 ]; then
             log_info "Container '$container_name' created and started successfully."
@@ -658,7 +716,7 @@ auto_create_and_start() {
     fi
 
     check_required_files
-    
+
 
     local container_name="${CONTAINER_PREFIX}_c_$(date +%Y%m%d%H%M%S)"
     if [ $(docker ps -a --filter "name=$container_name" --format "{{.Names}}") ]; then
@@ -673,7 +731,7 @@ auto_create_and_start() {
         cd "$HOST_WORK_DIR" || exit 1
         mkdir -p "$HOST_SOURCES_DIR" || exit 1
         cd "$HOST_SOURCES_DIR" || exit 1
-        
+
         init_and_sync_repo || exit 1
 
         # Verify the meta-dse-bsp directory was created
@@ -703,7 +761,7 @@ auto_create_and_start() {
         # update_meta_gateway part of manifest
     fi
 
-    # Increase inotify limit. Required for Yocto builds, observed 
+    # Increase inotify limit. Required for Yocto builds, observed
     # Reason: Observed 'ERROR: No space left on device or exceeds fs.inotify.max_user_watches?' during yocto bitbaking
     if [ "$(sysctl -n fs.inotify.max_user_watches)" -ne 524288 ]; then
         echo "Setting inotify limit to 524288"
@@ -715,21 +773,28 @@ auto_create_and_start() {
         mkdir -p "$HOST_WORK_DIR/${container_name}_build/tmp" || exit 1
     fi
 
+    if [ ! -d "$HOST_DOWNLOADS_DIR" ]; then
+        mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
+    fi
+
+    mkdir -p "$HOST_SSTATE_DIR" || exit 1
+
     cp -r "$HOST_SSH_DIR" "$HOST_WORK_DIR/ssh" || exit 1
 
     log_yellow "Creating $ENGINE_DISPLAY_NAME container '$container_name'..."
-        
+
     # cp "$HOST_SOURCES_DIR/meta-dse-bsp/setup-environment" "$HOST_SOURCES_DIR/setup-environment" || exit 1
 
-    docker run -it --network host --cap-add NET_RAW --name $container_name \
+    docker run -it --network host --name $container_name \
+        "${PODMAN_USERNS_ARGS[@]}" \
         -v "$HOST_WORK_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
         -v "$HOST_SOURCES_DIR:${YOCTO_USER_HOME}/sources" \
         -v "$HOST_DOWNLOADS_DIR:${YOCTO_USER_HOME}/downloads" \
         -v "$HOST_WORK_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
-        -v "$HOST_WORK_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build_dse_gw/tmp" \
+        -v "$HOST_WORK_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build-dse-gateway/tmp" \
+        -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build-dse-gateway/sstate-cache" \
         -v "$HOST_GITCONFIG:${YOCTO_USER_HOME}/.gitconfig" \
         $IMAGE_NAME
-       #  -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build_dse_gw/sstate-cache" \
 
     if [ $? -eq 0 ]; then
         log_info "Container '$container_name' created and started successfully."
@@ -774,7 +839,11 @@ show_help() {
     echo "  auto            Create a new image and start a container automatically"
     echo "  clean           Delete all containers with prefix '$CONTAINER_PREFIX'"
     echo
-    
+    echo "Environment:"
+    echo "  CORP_PROXY=true Enable TLS-bypass / insecure-registry workarounds for"
+    echo "                  TLS-intercepting corporate proxies (default: false)"
+    echo
+
     log_yellow "Interactive options: Run the script without any arguments to use these options [ $0 ]"
     echo "  (S) Start an existing container"
     echo "  (E) Open a new interactive session to a running container"
