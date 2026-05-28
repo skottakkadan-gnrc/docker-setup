@@ -372,6 +372,8 @@ if ! run_as_host_user env ${GIT_SSL_ENV} "$repo_tool" init --config-name --no-re
         chmod -R u+rwX,go+rX "$HOST_WORK_DIR/.repo" || log_yellow "Warning: failed to update .repo permissions; container may still not have access."
     fi
 
+    fix_source_permissions
+
     # Ensure downloads, sstate and work/build dirs are writable by the container
     mkdir -p "$HOST_DOWNLOADS_DIR" "$HOST_SSTATE_DIR"
     if chmod -R a+rwX "$HOST_DOWNLOADS_DIR" "$HOST_SSTATE_DIR" "$HOST_WORK_DIR" 2>/dev/null; then
@@ -422,6 +424,22 @@ check_required_files() {
         log_error "One or more required files are missing. Exiting."
         exit 1
     fi
+}
+
+fix_source_permissions() {
+    if [ ! -d "$HOST_SOURCES_DIR" ]; then
+        return 0
+    fi
+
+    if id -u "$HOST_USER" >/dev/null 2>&1; then
+        if [ "$(id -u)" -eq 0 ]; then
+            chown -R "$HOST_USER":"$HOST_USER" "$HOST_SOURCES_DIR" || log_yellow "Warning: failed to chown $HOST_SOURCES_DIR"
+        elif command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$HOST_USER":"$HOST_USER" "$HOST_SOURCES_DIR" || log_yellow "Warning: failed to sudo chown $HOST_SOURCES_DIR"
+        fi
+    fi
+
+    chmod -R u+rwX,go+rX "$HOST_SOURCES_DIR" || log_yellow "Warning: failed to chmod $HOST_SOURCES_DIR"
 }
 
 # Function to verify meta-dse-bsp is a valid git repository
@@ -540,9 +558,9 @@ create_container() {
             sudo sysctl -p || exit 1
         fi
 
-        if [ ! -d "$HOST_WORK_DIR/${container_name}_build/tmp" ]; then
-            mkdir -p "$HOST_WORK_DIR/${container_name}_build/tmp" || exit 1
-        fi
+        mkdir -p "$HOST_WORK_DIR/${container_name}_build" || exit 1
+        mkdir -p "$HOST_WORK_DIR/${container_name}_build/tmp" || exit 1
+        chmod -R a+rwX "$HOST_WORK_DIR/${container_name}_build" || true
 
         if [ ! -d "$HOST_DOWNLOADS_DIR" ]; then
             mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
@@ -552,21 +570,15 @@ create_container() {
         # faster rebuilds). Mounted into the build dir below.
         mkdir -p "$HOST_SSTATE_DIR" || exit 1
 
-        cp -r "$HOST_SSH_DIR" "$HOST_WORK_DIR/ssh" || exit 1
+    fix_source_permissions
 
-        log_yellow "Creating $ENGINE_DISPLAY_NAME container '$container_name'..."
-
-        # cp "$HOST_SOURCES_DIR/meta-dse-bsp/setup-environment" "$HOST_SOURCES_DIR/setup-environment" || exit 1
-
-        # Start container detached so we can configure git safe.directory entries,
-        # then attach interactively.
         docker run -d --network host --name $container_name \
             "${PODMAN_USERNS_ARGS[@]}" \
             -v "$HOST_WORK_DIR/ssh:${YOCTO_USER_HOME}/.ssh" \
             -v "$HOST_SOURCES_DIR:${YOCTO_USER_HOME}/sources" \
             -v "$HOST_DOWNLOADS_DIR:${YOCTO_USER_HOME}/downloads" \
             -v "$HOST_WORK_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
-            -v "$HOST_WORK_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build-dse-gateway/tmp" \
+            -v "$HOST_WORK_DIR/${container_name}_build:${YOCTO_USER_HOME}/build-dse-gateway" \
             -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build-dse-gateway/sstate-cache" \
             -v "$HOST_GITCONFIG:${YOCTO_USER_HOME}/.gitconfig" \
             $image_name tail -f /dev/null || {
@@ -663,8 +675,11 @@ delete_image() {
     read -p "$(log_error "Do you want to proceed? (yes/no): ")" proceed
     if [[ "$proceed" == "yes" || "$proceed" == "Yes"|| "$proceed" == "YES" ]]; then
         local image_name=$1
-        docker rmi $image_name
-        log_info "Image '$image_name' deleted successfully."
+        if docker rmi $image_name; then
+            log_info "Image '$image_name' deleted successfully."
+        else
+            log_error "Failed to delete image '$image_name'. It may still be used by a container."
+        fi
     fi
 }
 
@@ -769,15 +784,17 @@ auto_create_and_start() {
         sudo sysctl -p || exit 1
     fi
 
-    if [ ! -d "$HOST_WORK_DIR/${container_name}_build/tmp" ]; then
-        mkdir -p "$HOST_WORK_DIR/${container_name}_build/tmp" || exit 1
-    fi
+    mkdir -p "$HOST_WORK_DIR/${container_name}_build" || exit 1
+    mkdir -p "$HOST_WORK_DIR/${container_name}_build/tmp" || exit 1
+    chmod -R a+rwX "$HOST_WORK_DIR/${container_name}_build" || true
 
     if [ ! -d "$HOST_DOWNLOADS_DIR" ]; then
         mkdir -p "$HOST_DOWNLOADS_DIR" || exit 1
     fi
 
     mkdir -p "$HOST_SSTATE_DIR" || exit 1
+
+    fix_source_permissions
 
     cp -r "$HOST_SSH_DIR" "$HOST_WORK_DIR/ssh" || exit 1
 
@@ -791,7 +808,7 @@ auto_create_and_start() {
         -v "$HOST_SOURCES_DIR:${YOCTO_USER_HOME}/sources" \
         -v "$HOST_DOWNLOADS_DIR:${YOCTO_USER_HOME}/downloads" \
         -v "$HOST_WORK_DIR/.repo:${YOCTO_USER_HOME}/.repo" \
-        -v "$HOST_WORK_DIR/${container_name}_build/tmp:${YOCTO_USER_HOME}/build-dse-gateway/tmp" \
+        -v "$HOST_WORK_DIR/${container_name}_build:${YOCTO_USER_HOME}/build-dse-gateway" \
         -v "$HOST_SSTATE_DIR:${YOCTO_USER_HOME}/build-dse-gateway/sstate-cache" \
         -v "$HOST_GITCONFIG:${YOCTO_USER_HOME}/.gitconfig" \
         $IMAGE_NAME
