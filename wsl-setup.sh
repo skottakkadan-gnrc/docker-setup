@@ -83,6 +83,15 @@ setup_locale() {
     fi
 }
 
+configure_git_protocol_rewrites() {
+    log_info "Configuring Git protocol rewrites: git:// -> https://"
+
+    git config --global url."https://git.kernel.org/".insteadOf "git://git.kernel.org/"
+    git config --global url."https://sourceware.org/".insteadOf "git://sourceware.org/"
+    git config --global url."https://git.yoctoproject.org/".insteadOf "git://git.yoctoproject.org/"
+    git config --global url."https://git.openembedded.org/".insteadOf "git://git.openembedded.org/"
+}
+
 verify_host_tools() {
     log_info "Verifying Yocto host tools"
 
@@ -402,6 +411,7 @@ main() {
             install_packages
             setup_locale
             install_zscaler_ca_from_windows
+            configure_git_protocol_rewrites
             verify_host_tools
             init_repo
             ;;
@@ -422,6 +432,7 @@ main() {
             install_packages
             setup_locale
             install_zscaler_ca_from_windows
+            configure_git_protocol_rewrites
             verify_host_tools
             init_repo
             sync_repo
